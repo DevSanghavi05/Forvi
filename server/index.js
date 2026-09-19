@@ -1,11 +1,14 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 
 import { scrape } from './engine/scrape.js';
 import { runRules } from './engine/rules.js';
 import { scoreFindings } from './engine/score.js';
-import { judge, humanize } from './engine/humanize.js';
+import { judge } from './engine/humanize.js';
+import { patchSite } from './engine/patch.js';
 
 const {
   GOOGLE_CLIENT_ID,
@@ -30,9 +33,42 @@ const REDIRECT_URI = `${APP_BASE_URL}/api/auth/callback/google`;
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// In-memory session store. Fine for local dev; swap for a real store
-// (Redis, a DB, or signed cookies) before deploying to production.
+// Session store, persisted to a file on disk so a past login survives server
+// restarts — users stay signed in when they come back instead of re-logging in
+// every time. Fine for local dev; swap for a real store (Redis/DB) in prod.
+const SESSIONS_FILE = fileURLToPath(new URL('../.forvi-sessions.json', import.meta.url));
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const sessions = new Map();
+
+try {
+  const stored = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+  const now = Date.now();
+  for (const [sid, entry] of Object.entries(stored)) {
+    // Back-compat: older entries were the bare user object (no createdAt).
+    if (entry && entry.user) {
+      if (!entry.createdAt || now - entry.createdAt < SESSION_TTL_MS) sessions.set(sid, entry);
+    } else if (entry) {
+      sessions.set(sid, { user: entry, createdAt: now });
+    }
+  }
+  if (sessions.size) console.log(`[forvi] restored ${sessions.size} saved session(s)`);
+} catch {
+  // no file yet, or unreadable — start empty
+}
+
+function persistSessions() {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessions)));
+  } catch (err) {
+    console.warn('[forvi] could not persist sessions:', err.message);
+  }
+}
+
+// Return the user for a session id (entries store { user, createdAt }).
+function sessionUser(sid) {
+  const entry = sid ? sessions.get(sid) : null;
+  return entry ? entry.user : null;
+}
 
 function parseCookies(req) {
   const out = {};
@@ -128,8 +164,9 @@ app.get('/api/auth/callback/google', async (req, res) => {
     };
 
     const sid = crypto.randomBytes(24).toString('hex');
-    sessions.set(sid, user);
-    setCookie(res, 'sid', sid, 60 * 60 * 24 * 7); // 7 days
+    sessions.set(sid, { user, createdAt: Date.now() });
+    persistSessions();
+    setCookie(res, 'sid', sid, 60 * 60 * 24 * 30); // 30 days — stay signed in
 
     res.redirect(`${APP_BASE_URL}/?auth=success`);
   } catch (err) {
@@ -140,14 +177,14 @@ app.get('/api/auth/callback/google', async (req, res) => {
 // The frontend calls this on load to learn who (if anyone) is signed in.
 app.get('/api/auth/me', (req, res) => {
   const { sid } = parseCookies(req);
-  const user = sid ? sessions.get(sid) : null;
+  const user = sessionUser(sid);
   if (!user) return res.status(401).json({ user: null });
   res.json({ user });
 });
 
 app.post('/api/auth/logout', (req, res) => {
   const { sid } = parseCookies(req);
-  if (sid) sessions.delete(sid);
+  if (sid && sessions.delete(sid)) persistSessions();
   clearCookie(res, 'sid');
   res.json({ ok: true });
 });
@@ -170,7 +207,7 @@ if (!process.env.ANTHROPIC_API_KEY) {
 // for guests.
 function requesterId(req) {
   const { sid } = parseCookies(req);
-  const user = sid ? sessions.get(sid) : null;
+  const user = sessionUser(sid);
   if (user) return { key: `u:${user.id}`, authed: true };
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown')
     .toString()
@@ -303,14 +340,11 @@ app.post('/api/humanize', async (req, res) => {
   if (!entry) return res.status(404).json({ error: 'Scan expired or not found. Run the scan again.' });
 
   try {
-    const result = await humanize(entry.scrape, entry.findings);
-    if (!result.html) return res.status(502).json({ error: 'The rewrite came back empty. Try again.' });
+    const result = await patchSite(entry.scrape, entry.findings);
+    if (!result.html) return res.status(502).json({ error: 'The humanized page came back empty. Try again.' });
     entry.humanized = result.html;
-    res.json({ scanId, html: result.html, truncated: result.truncated });
+    res.json({ scanId, html: result.html, changes: result.changes, fixedCount: result.fixedCount });
   } catch (err) {
-    if (err.code === 'NO_API_KEY') {
-      return res.status(503).json({ error: 'Humanizing needs ANTHROPIC_API_KEY on the server.' });
-    }
     console.error('[forvi] humanize failed:', err.message);
     res.status(502).json({ error: 'The humanizer failed. Try again.' });
   }

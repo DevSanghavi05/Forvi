@@ -49,6 +49,34 @@ function countClass(classAttrs, re, cap = 6) {
   return { count: n, samples };
 }
 
+// Count class attributes whose WHOLE string matches a regex (for co-occurring
+// tokens on one element, e.g. uppercase + tracking on the same eyebrow label).
+function countAttr(classAttrs, re, cap = 6) {
+  const samples = [];
+  let n = 0;
+  for (const attr of classAttrs || []) {
+    if (re.test(attr)) {
+      n++;
+      if (samples.length < cap) samples.push(String(attr).slice(0, 60));
+    }
+  }
+  return { count: n, samples };
+}
+
+// Count class attributes where EVERY regex matches somewhere in the same
+// attribute string (token co-occurrence on one element).
+function countAttrAll(classAttrs, regexes, cap = 6) {
+  const samples = [];
+  let n = 0;
+  for (const attr of classAttrs || []) {
+    if (regexes.every((r) => r.test(attr))) {
+      n++;
+      if (samples.length < cap) samples.push(String(attr).slice(0, 60));
+    }
+  }
+  return { count: n, samples };
+}
+
 // Merge several {count, samples} results into one.
 function merge(...results) {
   const out = { count: 0, samples: [] };
@@ -440,7 +468,7 @@ export const TELLS = [
     detect: (s) =>
       countRegex(
         s.text,
-        /\b(empower|seamless|seamlessly|effortless(ly)?|unlock|elevate|revolutioniz\w+|leverage|supercharge|harness|streamline|unleash|transform your|reimagine)\b/i,
+        /\b(empower|seamless(ly)?|effortless(ly)?|unlock|elevate|revolutioniz\w+|leverage|supercharge|turbocharge|harness|streamline|unleash|transform your|reimagine|frictionless|skyrocket|10x|next[- ]level|boost your|accelerate your|optimize your|take .{1,20} to the next level)\b/i,
       ),
   },
   {
@@ -453,7 +481,7 @@ export const TELLS = [
     detect: (s) =>
       countRegex(
         s.text,
-        /\b(unprecedented|revolutionary|cutting[- ]edge|world[- ]class|production[- ]grade|best[- ]in[- ]class|next[- ]generation|game[- ]chang\w+|state[- ]of[- ]the[- ]art)\b/i,
+        /\b(unprecedented|revolutionary|cutting[- ]edge|world[- ]class|production[- ]grade|best[- ]in[- ]class|next[- ]generation|game[- ]chang\w+|state[- ]of[- ]the[- ]art|industry[- ]leading|enterprise[- ]grade|blazing[- ]fast|lightning[- ]fast|unrivaled|unmatched|unparalleled)\b/i,
       ),
   },
   {
@@ -601,6 +629,276 @@ export const TELLS = [
     label: 'The canonical AI landing skeleton',
     why: 'Sticky nav → AI pill → centered hero + two buttons → logo strip → 3-col grid → bento → stat band → testimonials → 3-tier pricing → FAQ → CTA band → fat footer.',
     fix: 'Lead with the one section that proves this specific product; cut the template rest.',
+  },
+
+  // ===== EXPANDED CATALOG =====================================================
+
+  // ---- TYPOGRAPHY ---------------------------------------------------------
+  {
+    id: 'tracked-uppercase-eyebrow',
+    category: 'type',
+    severity: 'high',
+    label: 'Tracked uppercase eyebrow / kicker',
+    why: 'A small letter-spaced ALL-CAPS label sitting above the headline (often in an accent color or mono) is one of the most reflexive AI/Framer-template tells.',
+    fix: 'Fold the kicker into the headline, or make it sentence case at normal tracking. At most one per page.',
+    detect: (s) =>
+      merge(
+        countAttrAll(s.classAttrs, [/\buppercase\b/, /\btracking-(wide|wider|widest)\b/]),
+        countAttrAll(s.classAttrs, [/\buppercase\b/, /\btext-(xs|sm)\b/, /\bfont-(mono|semibold|bold)\b/]),
+        countRegex(s.css, /uppercase[^}]{0,120}letter-spacing|letter-spacing[^}]{0,120}uppercase/i),
+      ),
+  },
+  {
+    id: 'pure-black-white',
+    category: 'color',
+    severity: 'low',
+    label: 'Raw #000 / #fff instead of tuned neutrals',
+    why: 'Pure black on pure white (or the reverse) instead of tuned near-neutrals reads flat and harsh.',
+    fix: 'Use off-white on near-black; never raw extremes.',
+    detect: (s) => countRegex(s.css, /#000000\b|#ffffff\b|:\s*#000\b|:\s*#fff\b/gi),
+  },
+
+  // ---- COPY & TONE --------------------------------------------------------
+  {
+    id: 'ai-cliche-phrases',
+    category: 'copy',
+    severity: 'high',
+    label: 'AI cliche phrases',
+    why: 'Stock LLM connective tissue: "dive in", "delve", "when it comes to", "say goodbye to", "look no further", "imagine a world", "the truth is".',
+    fix: 'Cut them; say the specific thing.',
+    detect: (s) =>
+      countRegex(
+        s.text,
+        /\b(dive in|dive into|delve|let'?s face it|when it comes to|say goodbye to|look no further|imagine a world|the truth is|here'?s the thing|at the end of the day|rest assured|needless to say)\b/gi,
+      ),
+  },
+  {
+    id: 'ready-to-cta',
+    category: 'copy',
+    severity: 'medium',
+    label: '"Ready to..." CTA band',
+    why: 'A rhetorical "Ready to get started?" band before the footer is the template closing CTA.',
+    fix: 'Replace with a concrete, specific invitation tied to the product.',
+    detect: (s) => countRegex(s.text, /ready to \w+[^.?!]{0,30}\?/gi),
+  },
+  {
+    id: 'join-thousands',
+    category: 'copy',
+    severity: 'medium',
+    label: '"Join thousands..." vague social proof',
+    why: 'Crowd-size social proof with no real number or names.',
+    fix: 'Name a real customer or cite a sourced number, or cut it.',
+    detect: (s) => countRegex(s.text, /join (thousands|millions|\d[\d,]*\+?) of|used by (thousands|millions|teams)/gi),
+  },
+  {
+    id: 'trust-badges-unproven',
+    category: 'deploy',
+    severity: 'medium',
+    label: '"Trusted by / As seen in" with no proof',
+    why: 'Trust theater: logos or claims with no real relationship or link.',
+    fix: 'Only show real, provable customer logos and press.',
+    detect: (s) => countRegex(s.text, /\b(trusted by|as seen in|as featured in|backed by|loved by teams)\b/gi),
+  },
+  {
+    id: 'no-credit-card',
+    category: 'copy',
+    severity: 'low',
+    label: '"No credit card required" microcopy',
+    why: 'Reflexive SaaS-template microcopy under the signup CTA.',
+    fix: 'Drop it unless it is a real differentiator.',
+    detect: (s) => countRegex(s.text, /no credit card( required| needed)?|free forever|cancel anytime/gi),
+  },
+  {
+    id: 'everything-you-need',
+    category: 'copy',
+    severity: 'medium',
+    label: '"Everything you need" / "All-in-one" headline',
+    why: 'Category-abstraction headline template that would fit any product.',
+    fix: 'Lead with the one concrete thing this product does.',
+    detect: (s) =>
+      countRegex(s.text, /everything you need to|all[- ]in[- ]one (platform|solution|tool|app)|the only \w+ you'?ll ever need/gi),
+  },
+
+  // ---- LAYOUT & STRUCTURE -------------------------------------------------
+  {
+    id: 'sticky-everything',
+    category: 'layout',
+    severity: 'low',
+    label: 'Sticky nav / sticky everything',
+    why: 'position:sticky applied reflexively to nav, sidebars, and CTAs.',
+    fix: 'Make one element sticky if it earns it, not everything.',
+    detect: (s) => merge(countClass(s.classAttrs, /^sticky$/), countRegex(s.css, /position:\s*sticky/gi)),
+  },
+  {
+    id: 'single-centered-container',
+    category: 'layout',
+    severity: 'low',
+    label: 'One centered max-width container everywhere',
+    why: 'max-w-7xl mx-auto on every section, no asymmetry or full-bleed.',
+    fix: 'Vary widths; use full-bleed and asymmetry deliberately.',
+    detect: (s) => countClass(s.classAttrs, /^max-w-(5xl|6xl|7xl|screen-xl|screen-2xl)$/),
+  },
+  {
+    id: 'bento-grid',
+    category: 'layout',
+    severity: 'medium',
+    label: 'Bento grid filler',
+    why: 'A bento grid where equal-weight cells are just filler wearing a trendy name.',
+    fix: 'Use bento only when one cell genuinely deserves the big span.',
+    detect: (s) => countClass(s.classAttrs, /^(col-span-2|row-span-2)$/),
+  },
+
+  // ---- COMPONENTS & CHROME ------------------------------------------------
+  {
+    id: 'left-border-accent',
+    category: 'components',
+    severity: 'low',
+    label: 'Left-border accent bar',
+    why: 'Multicolored left-border "bookmark" bars fighting the corner radius.',
+    fix: 'Remove, or make the accent a real semantic signal.',
+    detect: (s) => countClass(s.classAttrs, /^border-l-(2|4|8)$/),
+  },
+  {
+    id: 'gradient-icon-tile',
+    category: 'icon',
+    severity: 'medium',
+    label: 'Gradient icon tile',
+    why: 'The rounded-square gradient tile behind a lucide icon, part of the Sparkles+AI fingerprint.',
+    fix: 'Use a flat, literal icon; drop the gradient chip.',
+    detect: (s) => countAttrAll(s.classAttrs, [/\brounded-(lg|xl|2xl)\b/, /\bbg-gradient-to-/]),
+  },
+  {
+    id: 'all-button-variants',
+    category: 'components',
+    severity: 'low',
+    claudeOnly: true,
+    label: 'Every button variant on one screen',
+    why: 'primary + secondary + outline + ghost all present with no hierarchy, so nothing leads.',
+    fix: 'One primary action per view; demote the rest.',
+  },
+
+  // ---- MOTION -------------------------------------------------------------
+  {
+    id: 'scroll-reveal-everything',
+    category: 'motion',
+    severity: 'medium',
+    label: 'Scroll fade-in-up on every section',
+    why: 'One global whileInView / AOS fade-up variant applied to every section.',
+    fix: 'Animate one focal moment; render the rest instantly.',
+    detect: (s) =>
+      merge(
+        countClass(s.classAttrs, /^(animate-fade|animate-in|fade-up|fade-in-up)$/),
+        countRegex(s.html, /data-aos=|whileInView|framer-motion/gi),
+      ),
+  },
+  {
+    id: 'logo-marquee',
+    category: 'motion',
+    severity: 'low',
+    label: 'Auto-scrolling logo marquee',
+    why: 'A marquee logo scroller looping forever.',
+    fix: 'Show a static, honest logo row.',
+    detect: (s) => merge(countClass(s.classAttrs, /^animate-(marquee|scroll)$/), countRegex(s.html, /marquee/gi)),
+  },
+  {
+    id: 'typewriter-hero',
+    category: 'motion',
+    severity: 'low',
+    claudeOnly: true,
+    label: 'Typewriter / rotating-word hero',
+    why: 'A hero headline that types itself out or cycles through words is decorative motion, not communication.',
+    fix: 'State the one headline plainly.',
+  },
+
+  // ---- ICONOGRAPHY & IMAGERY ---------------------------------------------
+  {
+    id: 'hand-drawn-doodle',
+    category: 'icon',
+    severity: 'medium',
+    claudeOnly: true,
+    label: 'Hand-drawn arrow / scribble doodle',
+    why: 'A squiggly hand-drawn arrow or circle pointing at a CTA or eyebrow is a Framer/template flourish.',
+    fix: 'Remove it; let layout and hierarchy direct attention.',
+  },
+  {
+    id: 'tilted-browser-mockup',
+    category: 'icon',
+    severity: 'low',
+    claudeOnly: true,
+    label: 'Tilted 3D browser mockup',
+    why: 'A floating product screenshot in a tilted 3D browser frame (often a fake UI).',
+    fix: 'Show the real product flat and legible.',
+  },
+
+  // ---- ACCESSIBILITY ------------------------------------------------------
+  {
+    id: 'skipped-heading-levels',
+    category: 'a11y',
+    severity: 'low',
+    label: 'Skipped heading levels',
+    why: 'Headings chosen by size (h1 -> h3/h4), breaking the semantic outline.',
+    fix: 'Use a semantic heading order; style with classes, not tag level.',
+    detect: (s) => {
+      const seq = ((s.html || '').match(/<h([1-6])\b/gi) || []).map((t) => Number(t.replace(/\D/g, '')));
+      let skips = 0;
+      let prev = 0;
+      const samples = [];
+      for (const lvl of seq) {
+        if (prev && lvl > prev + 1) {
+          skips++;
+          if (samples.length < 4) samples.push(`h${prev} -> h${lvl}`);
+        }
+        prev = lvl;
+      }
+      return { count: skips, samples };
+    },
+  },
+  {
+    id: 'missing-lang',
+    category: 'a11y',
+    severity: 'low',
+    label: 'Missing <html lang>',
+    why: 'No lang attribute on <html>, hurting screen readers and translation.',
+    fix: 'Add lang="en" (or the real language) to <html>.',
+    detect: (s) => ({ count: /<html\b[^>]*\blang=/i.test(s.html || '') ? 0 : 1, samples: [] }),
+  },
+
+  // ---- DEPLOYMENT & TRUST -------------------------------------------------
+  {
+    id: 'default-page-title',
+    category: 'deploy',
+    severity: 'medium',
+    label: 'Default framework page title',
+    why: 'Title left as "Vite App", "Create Next App", "React App", "Home", or empty.',
+    fix: 'Write a real, specific <title>.',
+    detect: (s) => {
+      const t = (s.title || '').trim();
+      const bad = /^(vite app|create next app|react app|next app|home|untitled|document|my app|app)$/i.test(t);
+      return { count: bad ? 1 : 0, samples: bad ? [t || '(empty)'] : [] };
+    },
+  },
+  {
+    id: 'missing-meta-description',
+    category: 'deploy',
+    severity: 'low',
+    label: 'Missing meta description',
+    why: 'No meta description in the head — the default framework template was never filled in.',
+    fix: 'Add a real description and Open Graph tags.',
+    detect: (s) => ({ count: /<meta[^>]+name=["']description["']/i.test(s.html || '') ? 0 : 1, samples: [] }),
+  },
+  {
+    id: 'stale-copyright-year',
+    category: 'deploy',
+    severity: 'low',
+    label: 'Stale copyright year',
+    why: 'A copyright year older than the current year in the footer.',
+    fix: 'Use the current year (or a range) in the footer.',
+    detect: (s) => {
+      const now = new Date().getFullYear();
+      const yrs = [...String(s.text || '').matchAll(/(?:©|copyright)\s*(20\d{2})/gi)].map((m) => Number(m[1]));
+      const stale = yrs.filter((y) => y < now);
+      return { count: stale.length, samples: stale.slice(0, 3).map(String) };
+    },
   },
 ];
 

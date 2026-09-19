@@ -1,6 +1,24 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import Logo from './components/Logo';
 import './Dashboard.css';
+
+// Render the humanized page at desktop dimensions, then scale it to the panel
+// width and crop to the hero (top viewport) so it lines up exactly with the
+// original screenshot above it.
+const LOGICAL_WIDTH = 1280;
+const VIEWPORT_H = 900; // matches the scraper viewport, so before/after align
+function fitIframe(el) {
+  if (!el) return;
+  const wrap = el.parentElement;
+  if (!wrap) return;
+  const cw = wrap.clientWidth || LOGICAL_WIDTH;
+  const scale = cw / LOGICAL_WIDTH;
+  el.style.width = LOGICAL_WIDTH + 'px';
+  el.style.height = VIEWPORT_H + 'px';
+  el.style.transformOrigin = '0 0';
+  el.style.transform = `scale(${scale})`;
+  wrap.style.height = Math.round(VIEWPORT_H * scale) + 'px';
+}
 
 const SEV_LABEL = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
 
@@ -8,17 +26,10 @@ function severityClass(sev) {
   return `sev-${sev || 'low'}`;
 }
 
-// A framed browser chrome around either the original screenshot or the
-// humanized rewrite.
-function Frame({ url, children }) {
+// A clean frame around either the original screenshot or the humanized rewrite.
+function Frame({ children }) {
   return (
     <div className="shot-frame">
-      <div className="shot-bar">
-        <span className="shot-dot" />
-        <span className="shot-dot" />
-        <span className="shot-dot" />
-        <div className="shot-url">{url}</div>
-      </div>
       <div className="shot-body">{children}</div>
     </div>
   );
@@ -33,7 +44,20 @@ export default function Dashboard({ user, onSignOut }) {
   const [humanizeStatus, setHumanizeStatus] = useState('idle'); // idle | running | done | error
   const [humanizeError, setHumanizeError] = useState('');
   const [humanizedHtml, setHumanizedHtml] = useState('');
+  const [humanizeChanges, setHumanizeChanges] = useState([]);
+  const [humanizeFixed, setHumanizeFixed] = useState(0);
+  const [humanizePct, setHumanizePct] = useState(0);
+  const [changesOpen, setChangesOpen] = useState(false);
   const [view, setView] = useState('before'); // before | after
+
+  const afterIframeRef = useRef(null);
+  const pctTimer = useRef(null);
+  useEffect(() => {
+    const onResize = () => fitIframe(afterIframeRef.current);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  useEffect(() => () => { if (pctTimer.current) clearInterval(pctTimer.current); }, []);
 
   const name = user?.name || 'Guest';
   const initial = (name.trim()[0] || 'G').toUpperCase();
@@ -45,8 +69,12 @@ export default function Dashboard({ user, onSignOut }) {
     setError('');
     setData(null);
     setHumanizedHtml('');
+    setHumanizeChanges([]);
+    setHumanizeFixed(0);
     setHumanizeStatus('idle');
     setHumanizeError('');
+    setHumanizePct(0);
+    setChangesOpen(false);
     setView('before');
 
     try {
@@ -69,6 +97,12 @@ export default function Dashboard({ user, onSignOut }) {
     if (!data?.scanId || humanizeStatus === 'running') return;
     setHumanizeStatus('running');
     setHumanizeError('');
+    setHumanizePct(0);
+    // Live progress that eases toward 95% until the response lands, then 100%.
+    if (pctTimer.current) clearInterval(pctTimer.current);
+    pctTimer.current = setInterval(() => {
+      setHumanizePct((p) => (p >= 95 ? 95 : Math.min(95, Math.round(p + (95 - p) * 0.08 + 1))));
+    }, 300);
     try {
       const res = await fetch('/api/humanize', {
         method: 'POST',
@@ -78,11 +112,19 @@ export default function Dashboard({ user, onSignOut }) {
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || 'Humanize failed.');
       setHumanizedHtml(body.html);
+      setHumanizeChanges(body.changes || []);
+      setHumanizeFixed(body.fixedCount != null ? body.fixedCount : (body.changes || []).length);
+      setHumanizePct(100);
       setHumanizeStatus('done');
       setView('after');
     } catch (err) {
       setHumanizeError(err.message || 'Something went wrong.');
       setHumanizeStatus('error');
+    } finally {
+      if (pctTimer.current) {
+        clearInterval(pctTimer.current);
+        pctTimer.current = null;
+      }
     }
   };
 
@@ -194,9 +236,15 @@ export default function Dashboard({ user, onSignOut }) {
               <div className="dash-preview">
                 <div className="dash-preview-head">
                   <div className="dash-preview-tag">
-                    {view === 'after' ? 'Humanized rewrite' : 'Original page'}
+                    {humanizeStatus === 'running'
+                      ? 'Humanizing…'
+                      : humanizedHtml
+                        ? view === 'after'
+                          ? 'Humanized hero'
+                          : 'Original hero'
+                        : 'Original page'}
                   </div>
-                  {humanizedHtml && (
+                  {humanizedHtml && humanizeStatus !== 'running' && (
                     <div className="dash-toggle" role="tablist" aria-label="Preview">
                       <button
                         type="button"
@@ -220,14 +268,24 @@ export default function Dashboard({ user, onSignOut }) {
                   )}
                 </div>
 
-                <Frame url={data.url}>
-                  {view === 'after' && humanizedHtml ? (
-                    <iframe
-                      className="shot-iframe"
-                      title="Humanized preview"
-                      srcDoc={humanizedHtml}
-                      sandbox=""
-                    />
+                <Frame>
+                  {humanizeStatus === 'running' ? (
+                    <div className="shot-loading">
+                      <div className="shot-loading-ring" aria-hidden="true" />
+                      <div className="shot-loading-pct">{humanizePct}%</div>
+                    </div>
+                  ) : view === 'after' && humanizedHtml ? (
+                    <div className="shot-scale">
+                      <iframe
+                        className="shot-iframe"
+                        title="Humanized preview"
+                        srcDoc={humanizedHtml}
+                        sandbox=""
+                        scrolling="no"
+                        ref={afterIframeRef}
+                        onLoad={(e) => fitIframe(e.target)}
+                      />
+                    </div>
                   ) : data.screenshot ? (
                     <img className="shot-img" src={data.screenshot} alt={`Screenshot of ${data.url}`} />
                   ) : (
@@ -265,6 +323,38 @@ export default function Dashboard({ user, onSignOut }) {
                   <p className="dash-note dash-note--error">{humanizeError}</p>
                 )}
 
+                {humanizedHtml && humanizeChanges.length > 0 && (
+                  <div className={`dash-changes${changesOpen ? ' is-open' : ''}`}>
+                    {changesOpen && (
+                      <ul className="dash-changes-panel">
+                        {humanizeChanges.map((c, i) => (
+                          <li key={i}>{c}</li>
+                        ))}
+                      </ul>
+                    )}
+                    <button
+                      type="button"
+                      className="dash-changes-toggle"
+                      aria-expanded={changesOpen}
+                      onClick={() => setChangesOpen((o) => !o)}
+                    >
+                      <span>
+                        Humanized · {humanizeFixed}{' '}
+                        {humanizeFixed === 1 ? 'fix' : 'fixes'} applied
+                      </span>
+                      <svg viewBox="0 0 24 24" width="16" height="16" fill="none" aria-hidden="true">
+                        <path
+                          d="M6 15l6-6 6 6"
+                          stroke="currentColor"
+                          strokeWidth="2.2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                )}
+
                 {humanizedHtml ? (
                   <a
                     className="dash-apply"
@@ -280,7 +370,7 @@ export default function Dashboard({ user, onSignOut }) {
                     onClick={humanize}
                     disabled={humanizeStatus === 'running' || data.findings.length === 0}
                   >
-                    {humanizeStatus === 'running' ? 'Humanizing…' : 'Humanize this site'}
+                    {humanizeStatus === 'running' ? 'Removing tells…' : 'Humanize this site'}
                   </button>
                 )}
               </aside>
