@@ -1,0 +1,30 @@
+:root {
+  --paper: #f7f7f5;
+  --paper-solid: #f4f4f1;
+  --ink: #15171c;
+  --muted: #565b64;
+  --brand: #2f5fe6;
+  --brand-strong: #244fce;
+  --hairline: rgba(21, 23, 28, 0.12);
+
+  color-scheme: light;
+  font-family: 'Hanken Grotesk', system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}
