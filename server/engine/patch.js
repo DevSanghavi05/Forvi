@@ -34,6 +34,99 @@ function applyCopyReplacement(html, find, replace) {
   return { html, ok: false };
 }
 
+// ---- purple → blue recolor --------------------------------------------------
+// Dev's rule: "if the theme is purple, make it blue." We swap the HUE of every
+// purple/indigo/violet/fuchsia color VALUE in the CSS to blue, keeping its
+// saturation and lightness — so a light lavender pill stays light, a deep purple
+// button stays deep, they just turn blue. Done on the color VALUE (not by
+// renaming Tailwind classes) because JIT-inlined CSS only ships the utilities the
+// page actually used, so renaming `bg-purple-500`→`bg-blue-500` would leave an
+// element with no rule at all.
+const BLUE_HUE = 217; // Tailwind blue-500 hue
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h = 0;
+  const l = (max + min) / 2;
+  const d = max - min;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  if (d !== 0) {
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    if (h < 0) h += 360;
+  }
+  return { h, s, l };
+}
+function hslToRgb(h, s, l) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+  let r = 0, g = 0, b = 0;
+  if (h < 60) [r, g, b] = [c, x, 0];
+  else if (h < 120) [r, g, b] = [x, c, 0];
+  else if (h < 180) [r, g, b] = [0, c, x];
+  else if (h < 240) [r, g, b] = [0, x, c];
+  else if (h < 300) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)];
+}
+// Purple family = hue 225–320. Tailwind's indigo ramp runs ~226° (indigo-50) to
+// ~243° (indigo-600), violet ~258, purple ~271, fuchsia ~292 — so 225 catches the
+// whole indigo/violet/purple/fuchsia set including its light tints. True blue
+// (blue-500 217°, blue-600 221°, blue-700 224°), cyan/sky (<210), pink/rose
+// (>320) and grays (low S) are left alone.
+function isPurpleHsl(h, s, l) {
+  return s > 0.12 && l > 0.08 && l < 0.985 && h >= 225 && h <= 320;
+}
+function bluifyRgb(r, g, b) {
+  const { h, s, l } = rgbToHsl(r, g, b);
+  if (!isPurpleHsl(h, s, l)) return null;
+  return hslToRgb(BLUE_HUE, s, l);
+}
+function hx(n) { return n.toString(16).padStart(2, '0'); }
+// Rewrite every #hex / rgb() / hsl() purple in `css` to blue. Returns { css, n }.
+function recolorPurpleToBlue(css) {
+  let n = 0;
+  // Handles #rgb, #rgba, #rrggbb, #rrggbbaa (alpha preserved). Longest match first
+  // so an 8-digit value isn't mis-read as 6 + trailing chars.
+  css = css.replace(/#([0-9a-fA-F]{8}|[0-9a-fA-F]{6}|[0-9a-fA-F]{4}|[0-9a-fA-F]{3})\b/g, (m, hex) => {
+    let rgb;
+    let alpha = '';
+    if (hex.length === 3) rgb = hex.split('').map((c) => c + c).join('');
+    else if (hex.length === 4) { rgb = hex.slice(0, 3).split('').map((c) => c + c).join(''); alpha = hex[3] + hex[3]; }
+    else if (hex.length === 6) rgb = hex;
+    else { rgb = hex.slice(0, 6); alpha = hex.slice(6); }
+    const num = parseInt(rgb, 16);
+    const out = bluifyRgb((num >> 16) & 255, (num >> 8) & 255, num & 255);
+    if (!out) return m;
+    n++;
+    return `#${hx(out[0])}${hx(out[1])}${hx(out[2])}${alpha}`;
+  });
+  css = css.replace(/rgba?\(([^)]+)\)/gi, (m, inner) => {
+    const parts = inner.split(/[\s,/]+/).filter(Boolean);
+    const r = parseFloat(parts[0]), g = parseFloat(parts[1]), b = parseFloat(parts[2]);
+    if ([r, g, b].some((v) => Number.isNaN(v))) return m;
+    const out = bluifyRgb(r, g, b);
+    if (!out) return m;
+    n++;
+    const alpha = parts[3] !== undefined ? `,${parts[3]}` : '';
+    return `rgb${alpha ? 'a' : ''}(${out[0]},${out[1]},${out[2]}${alpha})`;
+  });
+  css = css.replace(/hsla?\(([^)]+)\)/gi, (m, inner) => {
+    const parts = inner.split(/[\s,/]+/).filter(Boolean);
+    const h = parseFloat(parts[0]);
+    const s = parseFloat(parts[1]) / 100;
+    const l = parseFloat(parts[2]) / 100;
+    if ([h, s, l].some((v) => Number.isNaN(v)) || !isPurpleHsl(h, s, l)) return m;
+    n++;
+    const alpha = parts[3] !== undefined ? ` / ${parts[3]}` : '';
+    return `hsl${alpha ? 'a' : ''}(${BLUE_HUE} ${parts[1]} ${parts[2]}${alpha})`;
+  });
+  return { css, n };
+}
+
 // Copy tells the LLM rewrites (find/replace on exact phrases).
 const COPY_TELLS = new Set([
   'buzzword-soup',
@@ -189,7 +282,7 @@ export async function patchSite(scrape, findings = []) {
     has('hover-scale-everything') || has('transition-all') || has('glassmorphism-everywhere') ||
     has('colored-glow-shadow') || has('rounded-2xl-card') || has('left-border-accent') ||
     has('gradient-blob-orb') || has('logo-marquee') || has('scroll-reveal-everything') ||
-    has('sticky-everything');
+    has('sticky-everything') || has('pill-badge-overuse');
 
   if (anyClassFix) {
     html = editClassAttrs(html, (cls) => {
@@ -216,12 +309,6 @@ export async function patchSite(scrape, findings = []) {
         if (has('left-border-accent') && /^border-l-(2|4|8)$/.test(t)) { bump('leftborder'); continue; }
         if (has('rounded-2xl-card') && /^rounded-2xl$/.test(t)) { bump('radius'); out.push('rounded-lg'); continue; }
         if (hasEyebrow && (/^uppercase$/.test(t) || /^tracking-(wide|wider|widest)$/.test(t))) { bump('eyebrow'); continue; }
-        if (has('bare-indigo-accent') && /^(bg|text|ring|border)-(indigo|violet|purple|fuchsia|blue)-(400|500|600|700)$/.test(t)) {
-          const kind = t.split('-')[0];
-          bump('accent');
-          out.push(kind === 'bg' ? 'bg-neutral-800' : kind === 'text' ? 'text-neutral-500' : `${kind}-neutral-400`);
-          continue;
-        }
         out.push(t);
       }
       return out.join(' ');
@@ -281,6 +368,21 @@ export async function patchSite(scrape, findings = []) {
     );
     if (n) changes.push(`Removed ${n} sparkle icon${n === 1 ? '' : 's'}`);
   }
+  // Remove ALL lucide-react / lucide icons, not just the default handful the
+  // detector names. lucide-react renders every icon as <svg class="lucide
+  // lucide-<name>" …>; vanilla lucide leaves <i data-lucide="…"> placeholders.
+  // Runs unconditionally so no lucide icon survives a humanize pass, even when
+  // the page uses icon names the `lucide-default-set` detector doesn't list.
+  {
+    let n = 0;
+    html = html.replace(
+      /<svg\b[^>]*\bclass=["'][^"']*\blucide\b[^"']*["'][^>]*>[\s\S]*?<\/svg>/gi,
+      () => { n++; return ''; },
+    );
+    html = html.replace(/<svg\b[^>]*\bdata-lucide=["'][^"']*["'][^>]*>[\s\S]*?<\/svg>/gi, () => { n++; return ''; });
+    html = html.replace(/<i\b[^>]*\bdata-lucide=["'][^"']*["'][^>]*>\s*<\/i>/gi, () => { n++; return ''; });
+    if (n) changes.push(`Removed ${n} lucide icon${n === 1 ? '' : 's'}`);
+  }
   if (has('placeholder-leakage')) {
     const n = (html.match(/\{\{[^}]{1,60}\}\}|\[Object Object\]/g) || []).length;
     html = html.replace(/\{\{[^}]{1,60}\}\}/g, '').replace(/\[Object Object\]/g, '');
@@ -334,7 +436,6 @@ export async function patchSite(scrape, findings = []) {
     ['glow', (c) => `Removed ${c} colored glow shadow${c === 1 ? '' : 's'}`],
     ['gradient', (c) => `Neutralized ${c} gradient class${c === 1 ? '' : 'es'}`],
     ['cliptext', (c) => `Un-clipped ${c} gradient-text element${c === 1 ? '' : 's'}`],
-    ['accent', (c) => `Recolored ${c} default accent${c === 1 ? '' : 's'} to a neutral`],
     ['eyebrow', (c) => `Normalized ${c} tracked-uppercase eyebrow${c === 1 ? '' : 's'}`],
     ['radius', (c) => `Toned down ${c} over-rounded card${c === 1 ? '' : 's'}`],
     ['leftborder', (c) => `Removed ${c} accent border bar${c === 1 ? '' : 's'}`],
@@ -373,6 +474,28 @@ export async function patchSite(scrape, findings = []) {
     });
     if (n && !tally.sticky) changes.push(`Un-stuck ${n} sticky element${n === 1 ? '' : 's'}`);
   }
+  // Kill pulsating dots authored in plain CSS / CSS-in-JS (the Tailwind
+  // `animate-pulse`/`animate-ping` class path is handled above). Rather than hunt
+  // every `animation:` property, we empty the offending @keyframes body itself —
+  // any `pulse`/`ping`/`blink`/`glow`/`throb`/`breathe` keyframe becomes a no-op,
+  // so the element stays put (a static dot) no matter what class drives it. Runs
+  // unconditionally so a throbbing status dot never survives a humanize pass.
+  {
+    let n = 0;
+    html = html.replace(
+      /@(-webkit-)?keyframes\s+([\w-]*(?:pulse|ping|blink|glow|throb|breathe|flash)[\w-]*)\s*\{(?:[^{}]|\{[^{}]*\})*\}/gi,
+      (_m, pfx, name) => { n++; return `@${pfx || ''}keyframes ${name}{}`; },
+    );
+    if (n && !tally.pulse) changes.push(`Stopped ${n} pulsing animation${n === 1 ? '' : 's'}`);
+  }
+  // Purple theme → blue. Runs on the whole document (inlined <style>, style=""
+  // attrs, and inline SVG fills), so a purple site comes out blue no matter how
+  // the color was authored. No-op when there's no purple.
+  {
+    const { css: recolored, n } = recolorPurpleToBlue(html);
+    html = recolored;
+    if (n) changes.push(`Recolored ${n} purple color${n === 1 ? '' : 's'} to blue`);
+  }
   if (has('emoji-in-headings')) {
     // Pictographic emoji only — deliberately excludes the arrow ranges so real
     // "→" affordances survive.
@@ -395,6 +518,45 @@ export async function patchSite(scrape, findings = []) {
   if (has('glassmorphism-everywhere')) overrides.push('[class*="backdrop-blur"]{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}');
   if (has('tracked-uppercase-eyebrow'))
     overrides.push('[class*="uppercase"][class*="tracking-"]{text-transform:none!important;letter-spacing:normal!important}');
+  if (has('inter-geist-default')) {
+    // Switch off the default Inter/Geist AI-era face. `[class]` (specificity
+    // 0,1,0) ties Tailwind's `.font-sans` utility and wins by source order (this
+    // <style> is injected last), so it beats the page's own font without an
+    // ugly universal `!important`. Monospace is preserved via a later-listed
+    // rule that wins the tie for code/mono elements.
+    overrides.push(
+      "html,body,[class]{font-family:'Avenir Next',Avenir,'Segoe UI',system-ui,-apple-system,BlinkMacSystemFont,sans-serif!important}" +
+        'code,pre,kbd,samp,[class*="mono"]{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace!important}',
+    );
+    changes.push('Switched off the default Inter/Geist font');
+  }
+  // Square every pill. Done as a CONCRETE CSS override (not by renaming
+  // `rounded-full`→`rounded-md`): with Tailwind's JIT-inlined CSS the target
+  // utility's rule usually isn't in the snapshot, so a rename would leave the
+  // element with NO radius rule at all. A pill = a `rounded-full` element with
+  // horizontal/vertical padding (`px-*`/`py-*`) — the label/badge/CTA chip shape;
+  // plus links/buttons that are rounded-full, and anything class-named
+  // badge/pill/chip. Avatars (`rounded-full w-/h-`, no padding) and status dots
+  // (`rounded-full h-2 w-2`) have no px/py and aren't links/badges, so they stay
+  // round on purpose. `!important` + concrete .4rem beats the page's own rule.
+  {
+    let pillCount = 0;
+    let namedPill = false;
+    for (const mm of html.matchAll(/class=["']([^"']*)["']/gi)) {
+      const c = mm[1];
+      if (/\brounded-full\b/.test(c) && /\b(px|py)-/.test(c)) pillCount++;
+      if (/\b(badge|pill|chip)\b/i.test(c) || /-(badge|pill|chip)\b/i.test(c)) namedPill = true;
+    }
+    const linkedPill = /<(?:a|button)\b[^>]*class=["'][^"']*\brounded-full\b/i.test(html);
+    if (pillCount || namedPill || linkedPill) {
+      overrides.push(
+        '[class*="rounded-full"][class*="px-"],[class*="rounded-full"][class*="py-"],' +
+          'a[class*="rounded-full"],button[class*="rounded-full"],[role="button"][class*="rounded-full"],' +
+          '[class*="badge"],[class*="pill"],[class*="chip"]{border-radius:.4rem!important}',
+      );
+      changes.push(pillCount ? `Squared ${pillCount} rounded-full pill${pillCount === 1 ? '' : 's'}` : 'Squared rounded-full pills into rectangles');
+    }
+  }
   if (has('shadow-everywhere')) {
     overrides.push('[class*="shadow-2xl"],[class*="shadow-xl"]{box-shadow:0 1px 3px rgba(0,0,0,.07)!important}');
     changes.push('Softened heavy uniform drop shadows');

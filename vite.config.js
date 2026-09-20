@@ -13,7 +13,9 @@ export default defineConfig({
       // browser only ever talks to one origin (cookies stay first-party).
       '/api': {
         target: 'http://localhost:8787',
-        changeOrigin: true,
+        // Keep the original Host (localhost:3001) so the API derives the right
+        // request origin for the OAuth callback URL. Do NOT rewrite it to :8787.
+        changeOrigin: false,
       },
     },
   },

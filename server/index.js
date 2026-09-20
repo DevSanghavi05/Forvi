@@ -9,65 +9,70 @@ import { runRules } from './engine/rules.js';
 import { scoreFindings } from './engine/score.js';
 import { judge } from './engine/humanize.js';
 import { patchSite } from './engine/patch.js';
+import { buildFixPrompt } from './engine/fixprompt.js';
 
 const {
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
-  APP_BASE_URL = 'http://localhost:5173',
+  APP_BASE_URL = 'http://localhost:3001',
   PORT = 8787,
 } = process.env;
 
-if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-  console.error(
-    '\n[forvi] Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET.\n' +
-      'Copy .env.example to .env and fill in your Google OAuth credentials.\n'
+const GOOGLE_ENABLED = Boolean(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET);
+if (!GOOGLE_ENABLED) {
+  console.warn(
+    '\n[forvi] GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google sign-in is disabled ' +
+      '(guest mode + scanning still work). Add them to .env to enable it.\n'
   );
-  process.exit(1);
 }
 
-// Google redirects the browser here after consent. This exact URL must be
-// listed under "Authorized redirect URIs" for the OAuth client in the
-// Google Cloud Console.
-const REDIRECT_URI = `${APP_BASE_URL}/api/auth/callback/google`;
+// The public origin of THIS request — so OAuth works on localhost AND on the
+// deployed domain with no hardcoded URL. Honors reverse-proxy headers (the app
+// is deployed as one service behind a host's proxy). Falls back to APP_BASE_URL.
+function requestOrigin(req) {
+  const xfHost = req.headers['x-forwarded-host'];
+  const host = (xfHost || req.headers.host || '').toString().split(',')[0].trim();
+  if (!host) return APP_BASE_URL;
+  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'http').toString().split(',')[0].trim();
+  return `${proto}://${host}`;
+}
+// Google redirects the browser to this exact URL after consent — it must be
+// listed under "Authorized redirect URIs" for the OAuth client in Google Cloud
+// Console (for every origin you use: http://localhost:3001 and your live domain).
+function oauthRedirectUri(req) {
+  return `${requestOrigin(req)}/api/auth/callback/google`;
+}
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-// Session store, persisted to a file on disk so a past login survives server
-// restarts — users stay signed in when they come back instead of re-logging in
-// every time. Fine for local dev; swap for a real store (Redis/DB) in prod.
-const SESSIONS_FILE = fileURLToPath(new URL('../.forvi-sessions.json', import.meta.url));
+// Stateless signed-cookie sessions. Required for serverless (no shared memory or
+// writable disk across function invocations) and it makes "stay signed in"
+// survive restarts/deploys for free. The cookie is `<base64url(payload)>.<hmac>`;
+// we verify the HMAC + expiry on every request — no server-side store.
+const SESSION_SECRET = process.env.SESSION_SECRET || GOOGLE_CLIENT_SECRET || 'forvi-dev-secret-change-me';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const sessions = new Map();
 
-try {
-  const stored = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
-  const now = Date.now();
-  for (const [sid, entry] of Object.entries(stored)) {
-    // Back-compat: older entries were the bare user object (no createdAt).
-    if (entry && entry.user) {
-      if (!entry.createdAt || now - entry.createdAt < SESSION_TTL_MS) sessions.set(sid, entry);
-    } else if (entry) {
-      sessions.set(sid, { user: entry, createdAt: now });
-    }
-  }
-  if (sessions.size) console.log(`[forvi] restored ${sessions.size} saved session(s)`);
-} catch {
-  // no file yet, or unreadable — start empty
+function signSession(user) {
+  const payload = Buffer.from(JSON.stringify({ u: user, exp: Date.now() + SESSION_TTL_MS })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
 }
 
-function persistSessions() {
-  try {
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(Object.fromEntries(sessions)));
-  } catch (err) {
-    console.warn('[forvi] could not persist sessions:', err.message);
-  }
-}
-
-// Return the user for a session id (entries store { user, createdAt }).
+// Return the user for a signed session cookie, or null if missing/tampered/expired.
 function sessionUser(sid) {
-  const entry = sid ? sessions.get(sid) : null;
-  return entry ? entry.user : null;
+  if (!sid || typeof sid !== 'string' || !sid.includes('.')) return null;
+  const [payload, sig] = sid.split('.');
+  const expect = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  if (!sig || sig.length !== expect.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expect))) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!data || !data.u || !data.exp || Date.now() > data.exp) return null;
+    return data.u;
+  } catch {
+    return null;
+  }
 }
 
 function parseCookies(req) {
@@ -90,8 +95,8 @@ function setCookie(res, name, value, maxAge) {
     'SameSite=Lax',
   ];
   if (maxAge != null) parts.push(`Max-Age=${maxAge}`);
-  // Add `Secure` automatically when served over https in production.
-  if (APP_BASE_URL.startsWith('https://')) parts.push('Secure');
+  // Add `Secure` when served over https (deployed) — harmless to omit on http localhost.
+  if (APP_BASE_URL.startsWith('https://') || process.env.NODE_ENV === 'production') parts.push('Secure');
   res.append('Set-Cookie', parts.join('; '));
 }
 
@@ -102,12 +107,15 @@ function clearCookie(res, name) {
 // Step 1 — kick off the OAuth flow: set a CSRF state cookie and bounce the
 // browser to Google's consent screen.
 app.get('/api/auth/google', (req, res) => {
+  if (!GOOGLE_ENABLED) {
+    return res.redirect(`${requestOrigin(req)}/?auth=disabled`);
+  }
   const state = crypto.randomBytes(16).toString('hex');
   setCookie(res, 'oauth_state', state, 600);
 
   const params = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID,
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: oauthRedirectUri(req),
     response_type: 'code',
     scope: 'openid email profile',
     state,
@@ -124,7 +132,7 @@ app.get('/api/auth/google', (req, res) => {
 app.get('/api/auth/callback/google', async (req, res) => {
   const fail = (reason) => {
     console.error('[forvi] auth callback failed:', reason);
-    res.redirect(`${APP_BASE_URL}/?auth=error`);
+    res.redirect(`${requestOrigin(req)}/?auth=error`);
   };
 
   try {
@@ -143,7 +151,7 @@ app.get('/api/auth/callback/google', async (req, res) => {
         code,
         client_id: GOOGLE_CLIENT_ID,
         client_secret: GOOGLE_CLIENT_SECRET,
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: oauthRedirectUri(req),
         grant_type: 'authorization_code',
       }),
     });
@@ -163,12 +171,9 @@ app.get('/api/auth/callback/google', async (req, res) => {
       picture: profile.picture || null,
     };
 
-    const sid = crypto.randomBytes(24).toString('hex');
-    sessions.set(sid, { user, createdAt: Date.now() });
-    persistSessions();
-    setCookie(res, 'sid', sid, 60 * 60 * 24 * 30); // 30 days — stay signed in
+    setCookie(res, 'sid', signSession(user), 60 * 60 * 24 * 30); // 30 days — stay signed in
 
-    res.redirect(`${APP_BASE_URL}/?auth=success`);
+    res.redirect(`${requestOrigin(req)}/?auth=success`);
   } catch (err) {
     fail(err instanceof Error ? err.message : String(err));
   }
@@ -182,9 +187,7 @@ app.get('/api/auth/me', (req, res) => {
   res.json({ user });
 });
 
-app.post('/api/auth/logout', (req, res) => {
-  const { sid } = parseCookies(req);
-  if (sid && sessions.delete(sid)) persistSessions();
+app.post('/api/auth/logout', (_req, res) => {
   clearCookie(res, 'sid');
   res.json({ ok: true });
 });
@@ -296,12 +299,29 @@ app.post('/api/scan', async (req, res) => {
       report,
     });
 
+    // The deliverable: a ready-to-paste prompt for Claude built from this site's
+    // exact tells + the universal de-AI rules. Included in the scan response so
+    // the "Copy fix prompt" button copies synchronously (no extra round-trip).
+    const fixPrompt = buildFixPrompt({
+      url: site.url,
+      findings,
+      score: report.score,
+      verdict: report.verdict,
+      totalInstances: report.totalInstances,
+    });
+
     res.json({
       scanId: id,
       url: site.url,
       title: site.title,
       screenshot: site.screenshot,
+      // The self-contained original page (fetched HTML + inlined CSS + <base>).
+      // The scraper no longer runs a browser, so there's no screenshot — the
+      // dashboard renders this in the "Before" iframe instead, which also lines
+      // up pixel-for-pixel with the humanized "After" iframe.
+      originalHtml: site.snapshot,
       aiJudgment,
+      fixPrompt,
       ...report,
       findings: findings.map((f) => ({
         id: f.id,
@@ -336,30 +356,59 @@ app.post('/api/humanize', async (req, res) => {
   }
 
   const scanId = req.body && req.body.scanId ? String(req.body.scanId) : '';
-  const entry = scans.get(scanId);
-  if (!entry) return res.status(404).json({ error: 'Scan expired or not found. Run the scan again.' });
+  const url = req.body && req.body.url ? String(req.body.url) : '';
 
   try {
+    // Use the cached scan when available (warm local process); otherwise
+    // re-scrape from the url so this works statelessly on serverless (where the
+    // in-memory scan store isn't shared across function invocations).
+    let entry = scanId ? scans.get(scanId) : null;
+    if (!entry) {
+      if (!url) return res.status(400).json({ error: 'Provide the url to humanize.' });
+      const site = await scrape(url);
+      const ruleFindings = runRules(site);
+      let aiFindings = [];
+      try {
+        aiFindings = await judge(site, ruleFindings);
+      } catch (err) {
+        if (err.code !== 'NO_API_KEY') console.error('[forvi] judge failed:', err.message);
+      }
+      const byId = new Map();
+      for (const f of [...ruleFindings, ...aiFindings]) if (!byId.has(f.id)) byId.set(f.id, f);
+      entry = { scrape: site, findings: [...byId.values()] };
+    }
     const result = await patchSite(entry.scrape, entry.findings);
     if (!result.html) return res.status(502).json({ error: 'The humanized page came back empty. Try again.' });
-    entry.humanized = result.html;
     res.json({ scanId, html: result.html, changes: result.changes, fixedCount: result.fixedCount });
   } catch (err) {
     console.error('[forvi] humanize failed:', err.message);
-    res.status(502).json({ error: 'The humanizer failed. Try again.' });
+    res.status(502).json({ error: err.message || 'The humanizer failed. Try again.' });
   }
 });
 
-// GET /api/humanize/:id/download -> the rewritten site as a file download
-app.get('/api/humanize/:id/download', (req, res) => {
-  const entry = scans.get(req.params.id);
-  if (!entry || !entry.humanized) return res.status(404).send('Not found. Humanize the scan first.');
-  res.set('Content-Type', 'text/html; charset=utf-8');
-  res.set('Content-Disposition', 'attachment; filename="humanized-site.html"');
-  res.send(entry.humanized);
-});
 
-app.listen(PORT, () => {
-  console.log(`[forvi] auth server on http://localhost:${PORT}`);
-  console.log(`[forvi] add this redirect URI in Google Cloud Console: ${REDIRECT_URI}`);
-});
+// On a persistent host / local dev we serve the built frontend and listen. On
+// Vercel (serverless) the platform serves dist/ statically and invokes the
+// exported `app` per request, so we skip both there.
+if (!process.env.VERCEL) {
+  const DIST_DIR = fileURLToPath(new URL('../dist', import.meta.url));
+  if (fs.existsSync(DIST_DIR)) {
+    app.use(express.static(DIST_DIR));
+    // SPA fallback: any non-/api path returns index.html so client routing works.
+    app.get(/^\/(?!api\/).*/, (_req, res) => {
+      res.sendFile(fileURLToPath(new URL('../dist/index.html', import.meta.url)));
+    });
+    console.log('[forvi] serving frontend from dist/ (single-service mode)');
+  } else {
+    console.warn('[forvi] dist/ not found — run `npm run build` so this server can serve the frontend too.');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`[forvi] server on http://localhost:${PORT}`);
+    console.log('[forvi] OAuth redirect URI is derived per-request; register these in Google Cloud Console:');
+    console.log('        http://localhost:3001/api/auth/callback/google  (local dev via Vite proxy)');
+    console.log('        https://YOUR-DOMAIN/api/auth/callback/google     (your deployed domain)');
+  });
+}
+
+export default app;

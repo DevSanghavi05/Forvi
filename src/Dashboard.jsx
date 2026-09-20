@@ -22,6 +22,19 @@ function fitIframe(el) {
 
 const SEV_LABEL = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
 
+// Parse an API response as JSON, but fail with a human message when the endpoint
+// returns an HTML error page (e.g. the app is deployed to a static host with no
+// backend, so /api/* hits the host's 404 page) instead of a cryptic
+// "Unexpected token '<'" from JSON.parse.
+async function readJson(res) {
+  const ct = res.headers.get('content-type') || '';
+  if (ct.includes('application/json')) return res.json();
+  await res.text().catch(() => '');
+  throw new Error(
+    `The Forvi API isn't reachable (HTTP ${res.status}). The backend server that renders and scans pages isn't running at this URL.`
+  );
+}
+
 function severityClass(sev) {
   return `sev-${sev || 'low'}`;
 }
@@ -49,6 +62,7 @@ export default function Dashboard({ user, onSignOut }) {
   const [humanizePct, setHumanizePct] = useState(0);
   const [changesOpen, setChangesOpen] = useState(false);
   const [view, setView] = useState('before'); // before | after
+  const [copied, setCopied] = useState(false);
 
   const afterIframeRef = useRef(null);
   const pctTimer = useRef(null);
@@ -76,6 +90,7 @@ export default function Dashboard({ user, onSignOut }) {
     setHumanizePct(0);
     setChangesOpen(false);
     setView('before');
+    setCopied(false);
 
     try {
       const res = await fetch('/api/scan', {
@@ -83,7 +98,7 @@ export default function Dashboard({ user, onSignOut }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       });
-      const body = await res.json();
+      const body = await readJson(res);
       if (!res.ok) throw new Error(body.error || 'Scan failed.');
       setData(body);
       setStatus('done');
@@ -107,9 +122,9 @@ export default function Dashboard({ user, onSignOut }) {
       const res = await fetch('/api/humanize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scanId: data.scanId }),
+        body: JSON.stringify({ scanId: data.scanId, url: data.url }),
       });
-      const body = await res.json();
+      const body = await readJson(res);
       if (!res.ok) throw new Error(body.error || 'Humanize failed.');
       setHumanizedHtml(body.html);
       setHumanizeChanges(body.changes || []);
@@ -126,6 +141,30 @@ export default function Dashboard({ user, onSignOut }) {
         pctTimer.current = null;
       }
     }
+  };
+
+  const copyPrompt = async () => {
+    const text = data?.fixPrompt || '';
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for browsers that block the async clipboard API.
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+      } catch {
+        /* give up silently */
+      }
+      ta.remove();
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2200);
   };
 
   return (
@@ -286,10 +325,22 @@ export default function Dashboard({ user, onSignOut }) {
                         onLoad={(e) => fitIframe(e.target)}
                       />
                     </div>
+                  ) : data.originalHtml ? (
+                    <div className="shot-scale">
+                      <iframe
+                        className="shot-iframe"
+                        title="Original page"
+                        srcDoc={data.originalHtml}
+                        sandbox=""
+                        scrolling="no"
+                        ref={afterIframeRef}
+                        onLoad={(e) => fitIframe(e.target)}
+                      />
+                    </div>
                   ) : data.screenshot ? (
                     <img className="shot-img" src={data.screenshot} alt={`Screenshot of ${data.url}`} />
                   ) : (
-                    <div className="shot-empty">No screenshot captured.</div>
+                    <div className="shot-empty">Couldn't render this page.</div>
                   )}
                 </Frame>
               </div>
@@ -355,24 +406,26 @@ export default function Dashboard({ user, onSignOut }) {
                   </div>
                 )}
 
-                {humanizedHtml ? (
-                  <a
-                    className="dash-apply"
-                    href={`/api/humanize/${data.scanId}/download`}
-                    download="humanized-site.html"
-                  >
-                    Download humanized site
-                  </a>
-                ) : (
+                <div className="dash-actions">
                   <button
                     className="dash-apply"
                     type="button"
-                    onClick={humanize}
-                    disabled={humanizeStatus === 'running' || data.findings.length === 0}
+                    onClick={copyPrompt}
+                    disabled={!data.fixPrompt || data.findings.length === 0}
                   >
-                    {humanizeStatus === 'running' ? 'Removing tells…' : 'Humanize this site'}
+                    {copied ? 'Copied to clipboard ✓' : 'Copy fix prompt'}
                   </button>
-                )}
+                  {!humanizedHtml && data.findings.length > 0 && (
+                    <button
+                      className="dash-secondary"
+                      type="button"
+                      onClick={humanize}
+                      disabled={humanizeStatus === 'running'}
+                    >
+                      {humanizeStatus === 'running' ? 'Removing tells…' : 'Preview the fix'}
+                    </button>
+                  )}
+                </div>
               </aside>
             </div>
           </section>

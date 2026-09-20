@@ -373,6 +373,41 @@
 .dash-apply:hover {
   background: var(--brand-strong);
 }
+.dash-apply:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* deliverable actions — Copy fix prompt (primary) + optional preview */
+.dash-actions {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.dash-actions .dash-apply {
+  margin-top: 0;
+}
+.dash-secondary {
+  width: 100%;
+  padding: 11px;
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.dash-secondary:hover {
+  background: var(--paper-solid);
+}
+.dash-secondary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
 
 /* verdict + notes */
 .dash-verdict {
@@ -618,13 +653,6 @@
   left: 0;
   color: #2f8f5b;
   font-weight: 700;
-}
-
-/* let the download button render as a link too */
-a.dash-apply {
-  display: block;
-  text-align: center;
-  text-decoration: none;
 }
 
 @media (max-width: 820px) {
