@@ -2,7 +2,6 @@ import Dither from './components/Dither';
 import DottedText from './components/DottedText';
 import Wave from './components/Wave';
 import Problem from './components/Problem';
-import Features from './components/Features';
 import Compare from './components/Compare';
 import CatchGrid from './components/CatchGrid';
 import Faq from './components/Faq';
@@ -85,7 +84,6 @@ export default function Landing({ onGetStarted }) {
         </div>
 
         <Problem reduceMotion={reduceMotion} />
-        <Features />
         <Compare />
         <CatchGrid reduceMotion={reduceMotion} />
         <Faq />
